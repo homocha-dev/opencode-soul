@@ -1,0 +1,44 @@
+{
+  "$schema": "./soul.schema.json",
+  "agents": {
+    "imessage": {
+      "soul": "koda",
+      "recall": {
+        "standard": true,
+        "deep": true
+      }
+    },
+    "build": {
+      "soul": "default",
+      "recall": {
+        "standard": true,
+        "deep": false
+      }
+    }
+  },
+  "souls": {
+    "koda": {
+      "file": "~/.config/opencode/souls/koda.md"
+    },
+    "default": {
+      "file": "~/.config/opencode/souls/default.md"
+    }
+  },
+  "memory": {
+    "dir": "~/.config/opencode/memory",
+    "encounters_dir": "~/.config/opencode/encounters",
+    "auto_index": true,
+    "categories": ["fact", "encounter", "pattern", "preference", "context"]
+  },
+  "recall": {
+    "standard": {
+      "candidates": 10,
+      "results": 5,
+      "threshold": 0.6
+    },
+    "deep": {
+      "explorers": 5,
+      "max_encounters": 10
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "opencode-soul",
+  "version": "0.0.1",
+  "description": "Persistent agent identity and memory recall for OpenCode",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target node",
+    "typecheck": "tsc --noEmit",
+    "dev": "bun build ./src/index.ts --outdir ./dist --target node --watch"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "memory",
+    "identity",
+    "soul",
+    "ai-agent"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@huggingface/transformers": "^3.4.1"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=0.1.0"
+  }
+}
