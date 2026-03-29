@@ -141,6 +141,44 @@ async function readSoul(): Promise<string | null> {
   return file.text();
 }
 
+// --- Realtime indexer ---
+
+// track messages per session for indexing
+const sessions: Map<string, { user: string[]; assistant: string[] }> =
+  new Map();
+// debounce indexing to avoid running on every single part update
+const pending: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
+async function indexExchange(
+  sessionID: string,
+  userText: string,
+  assistantText: string,
+  ctx: any,
+) {
+  // skip trivial exchanges
+  if (userText.length < 20 && assistantText.length < 50) return;
+
+  // save as encounter memory
+  const id = "mem_" + randomUUID().slice(0, 8);
+  const dir = join(MEMORY_DIR, "encounter");
+  await mkdir(dir, { recursive: true });
+  const content = `User asked: ${userText.slice(0, 200)}\nAssistant responded: ${assistantText.slice(0, 500)}`;
+  const md = `---\nid: ${id}\ntype: encounter\ncreated: ${new Date().toISOString()}\ntags: [auto-indexed]\nconfidence: medium\nsession: ${sessionID}\n---\n${content}\n`;
+  await Bun.write(join(dir, id + ".md"), md);
+
+  // index the embedding
+  const [vec] = await embed([content]);
+  if (vec) vectors.push({ id, vector: vec });
+
+  await ctx.client.app.log({
+    body: {
+      service: "soul",
+      level: "info",
+      message: `Auto-indexed encounter: ${id}`,
+    },
+  });
+}
+
 // --- Plugin ---
 
 export const SoulPlugin: Plugin = async (ctx) => {
@@ -159,6 +197,84 @@ export const SoulPlugin: Plugin = async (ctx) => {
   });
 
   return {
+    // realtime indexer — listen for message events
+    event: async ({ event }) => {
+      if (event.type !== "message.updated") return;
+      const data = event.properties as any;
+      if (!data?.sessionID || !data?.info) return;
+
+      const sid = data.sessionID;
+      if (!sessions.has(sid)) sessions.set(sid, { user: [], assistant: [] });
+      const session = sessions.get(sid)!;
+
+      if (data.info.role === "user") {
+        // extract text from user message parts
+        const parts = data.info.parts || [];
+        const text = parts
+          .filter((p: any) => p.type === "text")
+          .map((p: any) => p.text || "")
+          .join(" ")
+          .trim();
+        if (text) session.user.push(text);
+      }
+
+      if (data.info.role === "assistant") {
+        // debounce: assistant messages update many times (streaming)
+        // wait 2s after last update before indexing
+        const existing = pending.get(sid);
+        if (existing) clearTimeout(existing);
+
+        pending.set(
+          sid,
+          setTimeout(async () => {
+            pending.delete(sid);
+            try {
+              // fetch the latest assistant text
+              const result = await ctx.client.session.messages({
+                path: { sessionID: sid },
+              });
+              if (!result.data) return;
+              const messages = result.data as any[];
+
+              // find the last user + assistant pair
+              let lastUser = "";
+              let lastAssistant = "";
+              for (const msg of messages) {
+                if (msg.role === "user") {
+                  const text = (msg.parts || [])
+                    .filter((p: any) => p.type === "text")
+                    .map((p: any) => p.text || "")
+                    .join(" ")
+                    .trim();
+                  if (text) lastUser = text;
+                }
+                if (msg.role === "assistant") {
+                  const text = (msg.parts || [])
+                    .filter((p: any) => p.type === "text")
+                    .map((p: any) => p.text || "")
+                    .join(" ")
+                    .trim();
+                  if (text) lastAssistant = text;
+                }
+              }
+
+              if (lastUser && lastAssistant) {
+                await indexExchange(sid, lastUser, lastAssistant, ctx);
+              }
+            } catch (err) {
+              await ctx.client.app.log({
+                body: {
+                  service: "soul",
+                  level: "error",
+                  message: `Auto-indexer error: ${err}`,
+                },
+              });
+            }
+          }, 2000),
+        );
+      }
+    },
+
     // inject soul into system prompt
     "experimental.chat.system.transform": async (_input, output) => {
       const soul = await readSoul();
