@@ -67,28 +67,34 @@ async function listMemories(type?: string): Promise<Memory[]> {
   );
 }
 
-// --- Embeddings (lazy loaded) ---
+// --- Embeddings via fastembed ---
 
-let pipeline: any = null;
+let embedder: any = null;
 let vectors: { id: string; vector: number[] }[] = [];
 
-async function model() {
-  if (pipeline) return pipeline;
+async function initEmbedder() {
+  if (embedder) return embedder;
   try {
-    const { pipeline: create } = await import("@huggingface/transformers");
-    pipeline = await create("feature-extraction", "Xenova/all-MiniLM-L6-v2");
-    return pipeline;
+    const { EmbeddingModel, FlagEmbedding } = await import("fastembed");
+    embedder = await FlagEmbedding.init({
+      model: EmbeddingModel.AllMiniLML6V2,
+    });
+    return embedder;
   } catch (err) {
-    console.error("Embedding model failed to load:", err);
+    console.error("Fastembed failed to load:", err);
     return null;
   }
 }
 
-async function embed(text: string): Promise<number[]> {
-  const pipe = await model();
-  if (!pipe) return [];
-  const result = await pipe(text, { pooling: "mean", normalize: true });
-  return Array.from(result.data as Float32Array);
+async function embed(texts: string[]): Promise<number[][]> {
+  const model = await initEmbedder();
+  if (!model) return [];
+  const result = model.embed(texts);
+  const vecs: number[][] = [];
+  for await (const batch of result) {
+    for (const vec of batch) vecs.push(Array.from(vec));
+  }
+  return vecs;
 }
 
 function cosine(a: number[], b: number[]): number {
@@ -103,58 +109,28 @@ function cosine(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-let embeddingsReady = false;
-
 async function indexAll() {
   const memories = await listMemories();
-  vectors = [];
-  for (const mem of memories) {
-    const vec = await embed(mem.content);
-    if (vec.length > 0) vectors.push({ id: mem.id, vector: vec });
-  }
-  embeddingsReady = vectors.length > 0;
-  return memories.length;
-}
-
-// text-based fallback search when embeddings unavailable
-function textSearch(
-  query: string,
-  memories: Memory[],
-  n: number,
-): { id: string; score: number }[] {
-  const words = query
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((w) => w.length > 2);
-  return memories
-    .map((m) => {
-      const lower = m.content.toLowerCase();
-      const hits = words.filter((w) => lower.includes(w)).length;
-      const score = words.length > 0 ? hits / words.length : 0;
-      return { id: m.id, score };
-    })
-    .filter((r) => r.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, n);
+  if (memories.length === 0) return 0;
+  const texts = memories.map((m) => m.content);
+  const vecs = await embed(texts);
+  vectors = memories
+    .map((m, i) => ({ id: m.id, vector: vecs[i] }))
+    .filter((v) => v.vector);
+  return vectors.length;
 }
 
 async function search(
   query: string,
   n: number,
 ): Promise<{ id: string; score: number }[]> {
-  // try vector search first
-  if (embeddingsReady) {
-    const vec = await embed(query);
-    if (vec.length > 0) {
-      return vectors
-        .map((v) => ({ id: v.id, score: cosine(vec, v.vector) }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, n);
-    }
-  }
-  // fallback to text search
-  const memories = await listMemories();
-  return textSearch(query, memories, n);
+  if (vectors.length === 0) return [];
+  const [vec] = await embed([query]);
+  if (!vec) return [];
+  return vectors
+    .map((v) => ({ id: v.id, score: cosine(vec, v.vector) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, n);
 }
 
 // --- Soul helpers ---
@@ -207,7 +183,7 @@ export const SoulPlugin: Plugin = async (ctx) => {
       if (!text) return;
 
       const hits = await search(text, 5);
-      const threshold = 0.1; // low threshold for text-based fallback
+      const threshold = 0.5; // cosine similarity threshold
       const relevant = hits.filter((h) => h.score >= threshold);
       if (relevant.length === 0) return;
 
@@ -294,8 +270,8 @@ export const SoulPlugin: Plugin = async (ctx) => {
           const md = `---\nid: ${id}\ntype: ${args.type}\ncreated: ${new Date().toISOString()}\ntags: ${tags}\nconfidence: medium\n---\n${args.content}\n`;
           await Bun.write(join(dir, id + ".md"), md);
           // index the new memory
-          const vec = await embed(args.content);
-          if (vec.length > 0) vectors.push({ id, vector: vec });
+          const [vec] = await embed([args.content]);
+          if (vec) vectors.push({ id, vector: vec });
           return "Memory saved: " + id;
         },
       }),
