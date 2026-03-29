@@ -6,31 +6,21 @@ OPENCODE_SRC="/Users/mocha/.openclaw/workspace/opencode/packages/opencode"
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_DIR="/tmp/opencode-soul-test"
 
-echo "=== opencode-soul test harness ==="
-echo "Plugin: $PLUGIN_DIR"
-echo "Test dir: $TEST_DIR"
-echo ""
+# setup if test dir missing
+if [ ! -d "$TEST_DIR/.git" ]; then
+  echo "=== Setting up test workspace ==="
+  rm -rf "$TEST_DIR"
+  mkdir -p "$TEST_DIR/.opencode/plugins"
+  mkdir -p "$TEST_DIR/souls" "$TEST_DIR/memory" "$TEST_DIR/encounters"
+  cd "$TEST_DIR"
+  git init -q
+  git config user.email "test@test.com"
+  git config user.name "test"
+  echo "test" > README.md
+  git add . && git commit -q -m "init"
 
-# clean slate
-rm -rf "$TEST_DIR"
-mkdir -p "$TEST_DIR/.opencode/plugins"
-mkdir -p "$TEST_DIR/souls"
-mkdir -p "$TEST_DIR/memory"
-mkdir -p "$TEST_DIR/encounters"
-
-# init a git repo (opencode requires it)
-cd "$TEST_DIR"
-git init -q
-git config user.email "test@test.com"
-git config user.name "test"
-echo "test" > README.md
-git add . && git commit -q -m "init"
-
-# copy plugin file
-cp "$PLUGIN_DIR/test/soul-test-plugin.ts" "$TEST_DIR/.opencode/plugins/soul.ts"
-
-# create test soul
-cat > "$TEST_DIR/souls/test.md" << 'SOULEOF'
+  # soul
+  cat > "$TEST_DIR/souls/test.md" << 'SOULEOF'
 # Soul
 
 I am Echo, a test agent.
@@ -49,22 +39,39 @@ I am Echo, a test agent.
 - (nothing yet)
 SOULEOF
 
-# create opencode config
-cat > "$TEST_DIR/opencode.json" << 'CFGEOF'
+  # opencode config
+  cat > "$TEST_DIR/opencode.json" << 'CFGEOF'
 {
   "$schema": "https://opencode.ai/config.json",
   "instructions": ["/tmp/opencode-soul-test/souls/test.md"]
 }
 CFGEOF
 
-PROMPT="${1:-Who are you? What is your name? Use the soul_edit tool to add something to your Things Ive Learned section.}"
+  # dep for embeddings
+  cat > "$TEST_DIR/.opencode/package.json" << 'DEPEOF'
+{
+  "dependencies": {
+    "@huggingface/transformers": "^3.4.1"
+  }
+}
+DEPEOF
 
+  # seed memories
+  bash "$PLUGIN_DIR/test/seed-memories.sh"
+  echo ""
+fi
+
+# always copy latest plugin
+cp "$PLUGIN_DIR/test/soul-test-plugin.ts" "$TEST_DIR/.opencode/plugins/soul.ts"
+
+PROMPT="${1:-Who are you? What do you know about me?}"
+
+echo "=== opencode-soul test ==="
 echo "Prompt: $PROMPT"
 echo ""
-echo "--- Running ---"
 
-cd "$OPENCODE_SRC"
-bun run --conditions=browser ./src/index.ts -- run \
+cd "$TEST_DIR"
+bun run --conditions=browser "$OPENCODE_SRC/src/index.ts" -- run \
   --format json \
   "$PROMPT" \
   2>&1 | while IFS= read -r line; do
@@ -77,28 +84,25 @@ bun run --conditions=browser ./src/index.ts -- run \
       tool_use)
         t=$(echo "$line" | jq -r '.part.tool // empty' 2>/dev/null)
         state=$(echo "$line" | jq -r '.part.state.status // empty' 2>/dev/null)
-        echo "[TOOL: $t] status=$state"
+        echo "[TOOL: $t] $state"
         if [ "$state" = "error" ]; then
-          echo "$line" | jq -r '.part.state.error // empty' 2>/dev/null
+          echo "  ERROR: $(echo "$line" | jq -r '.part.state.error // empty' 2>/dev/null)"
         fi
         if [ "$state" = "completed" ]; then
-          echo "$line" | jq -r '.part.state.output // empty' 2>/dev/null | head -3
+          echo "  $(echo "$line" | jq -r '.part.state.output // empty' 2>/dev/null | head -5)"
         fi
         ;;
       step_finish)
-        reason=$(echo "$line" | jq -r '.part.reason // empty' 2>/dev/null)
         cost=$(echo "$line" | jq -r '.part.cost // empty' 2>/dev/null)
-        echo "[STEP DONE] reason=$reason cost=\$$cost"
+        echo "[STEP] cost=\$$cost"
         echo ""
         ;;
     esac
   done
 
-echo ""
-echo "=== Results ==="
-echo ""
-echo "Soul file after:"
+echo "=== Soul file ==="
 cat "$TEST_DIR/souls/test.md"
 echo ""
-echo "Memories:"
-find "$TEST_DIR/memory" -name "*.md" -exec echo "---" \; -exec cat {} \; 2>/dev/null || echo "(none)"
+echo "=== Memories ==="
+find "$TEST_DIR/memory" -name "*.md" | wc -l | tr -d ' '
+echo " memory files"

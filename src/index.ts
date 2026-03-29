@@ -83,7 +83,6 @@ export const SoulPlugin: Plugin = async (ctx) => {
       );
 
       if (recalled.length > 0) {
-        // prepend recalled memories as a system-like context part
         const content = recalled
           .map(
             (r) =>
@@ -91,10 +90,11 @@ export const SoulPlugin: Plugin = async (ctx) => {
           )
           .join("\n");
 
-        output.parts.unshift({
-          type: "text" as any,
-          text: `[Recalled memories relevant to this message]\n${content}`,
-        } as any);
+        // prepend to first text part (can't insert new parts — they need id/sessionID/messageID)
+        const first = output.parts.find((p) => p.type === "text") as any;
+        if (first) {
+          first.text = `[Recalled memories]\n${content}\n\n[User message]\n${first.text}`;
+        }
 
         await ctx.client.app.log({
           body: {
