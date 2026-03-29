@@ -21,45 +21,86 @@ export const SoulPlugin: Plugin = async (ctx) => {
     },
   });
 
-  return {
-    // inject soul + recalled memories into every session
-    event: async ({ event }) => {
-      if (event.type === "session.created") {
-        // soul injection happens via instructions config
-        // this hook is for logging / future dynamic injection
-        await ctx.client.app.log({
-          body: {
-            service: "opencode-soul",
-            level: "info",
-            message: "Session started, soul active",
-          },
-        });
-      }
+  // resolve which soul to use for a given agent
+  function soulFor(agent?: string): string | null {
+    if (agent && cfg.agents[agent]) return cfg.agents[agent].soul;
+    if (cfg.agents["*"]) return cfg.agents["*"].soul;
+    return "default";
+  }
 
-      // auto-index encounters when session goes idle
+  function recallEnabled(agent?: string) {
+    if (agent && cfg.agents[agent]) return cfg.agents[agent].recall;
+    if (cfg.agents["*"]) return cfg.agents["*"].recall;
+    return { standard: true, deep: true };
+  }
+
+  return {
+    // bus events — auto-index on session idle
+    event: async ({ event }) => {
       if (event.type === "session.idle" && cfg.memory.auto_index) {
         await indexEncounter(ctx, store, embeddings, cfg);
       }
     },
 
-    // standard recall: auto-inject relevant memories on each message
-    "message.updated": async (input, output) => {
-      // TODO: determine current agent from context
-      // for now, run standard recall for all agents
+    // inject soul + recalled memories into the system prompt
+    "experimental.chat.system.transform": async (input, output) => {
+      // inject soul identity
+      const name = soulFor(undefined); // TODO: get agent from input when available
+      if (name) {
+        const soul = await readSoul(cfg, name);
+        if (soul) {
+          output.system.push(soul);
+        }
+      }
+
+      // inject recent memories
+      const recent = await store.recent(5);
+      if (recent.length > 0) {
+        output.system.push(
+          `## Recent Memories\n${recent.map((m) => `- [${m.type}] ${m.content}`).join("\n")}`,
+        );
+      }
+    },
+
+    // standard recall on each user message — inject relevant memories
+    "chat.message": async (input, output) => {
+      const recall = recallEnabled(input.agent);
+      if (!recall.standard) return;
+
+      // extract text from user message parts
+      const text = output.parts
+        .filter((p) => p.type === "text")
+        .map((p: any) => p.text || "")
+        .join(" ");
+
+      if (!text) return;
+
       const recalled = await standardRecall(
-        input,
+        text,
         store,
         embeddings,
         cfg.recall.standard,
       );
+
       if (recalled.length > 0) {
-        // inject recalled memories into the message context
-        // this will be available to the agent as additional context
+        // prepend recalled memories as a system-like context part
+        const content = recalled
+          .map(
+            (r) =>
+              `- [${r.memory.type}] ${r.memory.content} (relevance: ${Math.round(r.score * 100)}%)`,
+          )
+          .join("\n");
+
+        output.parts.unshift({
+          type: "text" as any,
+          text: `[Recalled memories relevant to this message]\n${content}`,
+        } as any);
+
         await ctx.client.app.log({
           body: {
             service: "opencode-soul",
-            level: "debug",
-            message: `Standard recall: ${recalled.length} memories injected`,
+            level: "info",
+            message: `Standard recall: ${recalled.length} memories`,
           },
         });
       }
@@ -67,20 +108,19 @@ export const SoulPlugin: Plugin = async (ctx) => {
 
     // preserve identity across compaction
     "experimental.session.compacting": async (input, output) => {
-      const soul = await readSoul(cfg, "default");
-      if (soul) {
-        output.context.push(`
-## Agent Identity (SOUL.md)
-${soul}
-`);
+      const name = soulFor(undefined);
+      if (name) {
+        const soul = await readSoul(cfg, name);
+        if (soul) {
+          output.context.push(`## Agent Identity (SOUL.md)\n${soul}`);
+        }
       }
 
       const recent = await store.recent(5);
       if (recent.length > 0) {
-        output.context.push(`
-## Recent Memories
-${recent.map((m) => `- [${m.type}] ${m.content}`).join("\n")}
-`);
+        output.context.push(
+          `## Recent Memories\n${recent.map((m) => `- [${m.type}] ${m.content}`).join("\n")}`,
+        );
       }
     },
 
@@ -101,7 +141,7 @@ ${recent.map((m) => `- [${m.type}] ${m.content}`).join("\n")}
           ),
         },
         async execute(args, context) {
-          const name = args.soul || "default";
+          const name = args.soul || soulFor(undefined) || "default";
           const result = await writeSoul(cfg, name, args.section, args.content);
           return result;
         },
@@ -134,7 +174,7 @@ ${recent.map((m) => `- [${m.type}] ${m.content}`).join("\n")}
 
       need_context: tool({
         description:
-          "Deep recall — use when you need to trace back through past experiences to find specific context. This spawns parallel explorer agents that search through your memory and past encounters from multiple angles. Use when standard recall isn't enough and you need to investigate.",
+          "Deep recall — use when you need to trace back through past experiences to find specific context. This searches through your memory and past encounters from multiple angles. Use when you feel like you're missing context about something that might have come up before.",
         args: {
           query: tool.schema.string(
             "What are you trying to remember or find context about?",
