@@ -1,17 +1,15 @@
 {
   "name": "opencode-soul",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Persistent agent identity and memory recall for OpenCode",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "src/plugin.ts",
   "files": [
-    "dist"
+    "src"
   ],
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target node",
-    "typecheck": "tsc --noEmit",
-    "dev": "bun build ./src/index.ts --outdir ./dist --target node --watch"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "opencode",
@@ -21,16 +19,29 @@
     "soul",
     "ai-agent"
   ],
+  "author": "homocha-dev",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/homocha-dev/opencode-soul"
+  },
   "dependencies": {
-    "@huggingface/transformers": "^3.4.1"
+    "@opencode-ai/plugin": "^1.0.115",
+    "fastembed": "^2.1.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "latest",
     "@types/bun": "latest",
     "typescript": "^5.7.0"
   },
-  "peerDependencies": {
-    "@opencode-ai/plugin": ">=0.1.0"
+  "opencode": {
+    "type": "plugin",
+    "hooks": [
+      "experimental.chat.system.transform",
+      "chat.message",
+      "experimental.session.compacting"
+    ]
+  },
+  "engines": {
+    "bun": ">=1.0.0"
   }
 }
