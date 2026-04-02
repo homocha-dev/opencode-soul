@@ -3,57 +3,47 @@ import { tool } from "@opencode-ai/plugin";
 import { loadConfig } from "./config";
 import { createStore } from "./store";
 import { createEmbeddings } from "./embeddings";
-import { standardRecall } from "./recall/standard";
-import { deepRecall } from "./recall/deep";
 import { indexEncounter } from "./indexer";
 import { readSoul, writeSoul } from "./soul";
+import { curateAsync, isCurator } from "./curator";
+import { appendMessage as appendTranscript } from "./transcript";
 
 export const SoulPlugin: Plugin = async (ctx) => {
   const cfg = await loadConfig(ctx.directory);
   const store = await createStore(cfg);
   const embeddings = await createEmbeddings();
 
-  await ctx.client.app.log({
-    body: {
-      service: "opencode-soul",
-      level: "info",
-      message: "Soul plugin initialized",
-    },
-  });
+  const log = async (level: string, msg: string) => {
+    await ctx.client.app.log({
+      body: { service: "opencode-soul", level: level as any, message: msg },
+    });
+  };
 
-  // resolve which soul to use for a given agent
+  await log("info", "Soul plugin initialized");
+
+  // Track which messages we've already logged to avoid duplicates
+  const loggedMessages = new Set<string>();
+
   function soulFor(agent?: string): string | null {
     if (agent && cfg.agents[agent]) return cfg.agents[agent].soul;
     if (cfg.agents["*"]) return cfg.agents["*"].soul;
     return "default";
   }
 
-  function recallEnabled(agent?: string) {
-    if (agent && cfg.agents[agent]) return cfg.agents[agent].recall;
-    if (cfg.agents["*"]) return cfg.agents["*"].recall;
-    return { standard: true, deep: true };
-  }
-
   return {
-    // bus events — auto-index on session idle
     event: async ({ event }) => {
       if (event.type === "session.idle" && cfg.memory.auto_index) {
         await indexEncounter(ctx, store, embeddings, cfg);
       }
     },
 
-    // inject soul + recalled memories into the system prompt
-    "experimental.chat.system.transform": async (input, output) => {
-      // inject soul identity
-      const name = soulFor(undefined); // TODO: get agent from input when available
+    // inject soul + recent memories into system prompt
+    "experimental.chat.system.transform": async (_input, output) => {
+      const name = soulFor(undefined);
       if (name) {
         const soul = await readSoul(cfg, name);
-        if (soul) {
-          output.system.push(soul);
-        }
+        if (soul) output.system.push(soul);
       }
-
-      // inject recent memories
       const recent = await store.recent(5);
       if (recent.length > 0) {
         output.system.push(
@@ -62,60 +52,76 @@ export const SoulPlugin: Plugin = async (ctx) => {
       }
     },
 
-    // standard recall on each user message — inject relevant memories
+    // Log user messages + run curator
     "chat.message": async (input, output) => {
-      const recall = recallEnabled(input.agent);
-      if (!recall.standard) return;
+      if (isCurator(input.sessionID)) return;
 
-      // extract text from user message parts
-      const text = output.parts
-        .filter((p) => p.type === "text")
-        .map((p: any) => p.text || "")
-        .join(" ");
+      // Log user message to transcript LIVE
+      try {
+        appendTranscript("user", input.agent, output.parts, input.sessionID);
+      } catch {}
 
-      if (!text) return;
+      // Curator only runs via need_context tool, not auto on every message
+    },
 
-      const recalled = await standardRecall(
-        text,
-        store,
-        embeddings,
-        cfg.recall.standard,
-      );
+    // Log tool start/finish to transcript LIVE
+    "tool.execute.before": async (input) => {
+      if (isCurator(input.sessionID)) return;
+      try {
+        const args = (input as any).args || {};
+        appendTranscript("tool_start", undefined, [{
+          type: "tool",
+          tool: input.tool,
+          state: { status: "started", input: args },
+        }], input.sessionID);
+      } catch {}
+    },
 
-      if (recalled.length > 0) {
-        const content = recalled
-          .map(
-            (r) =>
-              `- [${r.memory.type}] ${r.memory.content} (relevance: ${Math.round(r.score * 100)}%)`,
-          )
-          .join("\n");
+    "tool.execute.after": async (input) => {
+      if (isCurator(input.sessionID)) return;
+      try {
+        appendTranscript("tool_end", undefined, [{
+          type: "tool",
+          tool: input.tool,
+          state: { status: "completed", input: (input as any).args || {} },
+        }], input.sessionID);
+      } catch {}
+    },
 
-        // prepend to first text part (can't insert new parts — they need id/sessionID/messageID)
-        const first = output.parts.find((p) => p.type === "text") as any;
-        if (first) {
-          first.text = `[Recalled memories]\n${content}\n\n[User message]\n${first.text}`;
-        }
-
-        await ctx.client.app.log({
-          body: {
-            service: "opencode-soul",
-            level: "info",
-            message: `Standard recall: ${recalled.length} memories`,
-          },
-        });
+    // Log assistant messages to transcript LIVE
+    "experimental.chat.messages.transform": async (_input, output) => {
+      for (const msg of output.messages) {
+        const info = msg?.info as any;
+        if (!info?.id || !info?.role) continue;
+        if (loggedMessages.has(info.id)) continue;
+        if (info.role !== "assistant") continue;
+        if (isCurator(info.sessionID)) continue;
+        // Only log if it has real content (text or tool calls)
+        const hasContent = msg.parts?.some(
+          (p: any) => p.type === "text" || p.type === "tool",
+        );
+        if (!hasContent) continue;
+        loggedMessages.add(info.id);
+        try {
+          appendTranscript("assistant", info.agent, msg.parts, info.sessionID);
+        } catch {}
+      }
+      // Keep set from growing unbounded
+      if (loggedMessages.size > 5000) {
+        const arr = [...loggedMessages];
+        arr.splice(0, 2500);
+        loggedMessages.clear();
+        for (const id of arr) loggedMessages.add(id);
       }
     },
 
     // preserve identity across compaction
-    "experimental.session.compacting": async (input, output) => {
+    "experimental.session.compacting": async (_input, output) => {
       const name = soulFor(undefined);
       if (name) {
         const soul = await readSoul(cfg, name);
-        if (soul) {
-          output.context.push(`## Agent Identity (SOUL.md)\n${soul}`);
-        }
+        if (soul) output.context.push(`## Agent Identity (SOUL.md)\n${soul}`);
       }
-
       const recent = await store.recent(5);
       if (recent.length > 0) {
         output.context.push(
@@ -124,8 +130,30 @@ export const SoulPlugin: Plugin = async (ctx) => {
       }
     },
 
-    // custom tools
     tool: {
+      // Curator decision tools — used by ephemeral curator sessions only.
+      no_context_needed: tool({
+        description:
+          "[Curator only] Signal that no additional context is needed.",
+        args: {},
+        async execute() {
+          return "No context needed.";
+        },
+      }),
+
+      include_context: tool({
+        description:
+          "[Curator only] Return found context to inject into the calling session.",
+        args: {
+          context: tool.schema.string(
+            "The context to inject. Be concise and relevant.",
+          ),
+        },
+        async execute(args) {
+          return `Context included: ${args.context.slice(0, 100)}...`;
+        },
+      }),
+
       soul_edit: tool({
         description:
           "Edit your SOUL.md identity file. Use this to update who you are — your personality, values, things you've learned about yourself or your human. Only for identity-level changes, not regular facts.",
@@ -140,16 +168,15 @@ export const SoulPlugin: Plugin = async (ctx) => {
             ),
           ),
         },
-        async execute(args, context) {
+        async execute(args) {
           const name = args.soul || soulFor(undefined) || "default";
-          const result = await writeSoul(cfg, name, args.section, args.content);
-          return result;
+          return writeSoul(cfg, name, args.section, args.content);
         },
       }),
 
       soul_remember: tool({
         description:
-          "Explicitly save a memory. Use this for important facts, preferences, or patterns you want to make sure are remembered. The auto-indexer handles most memories — use this for things you want to guarantee are saved with specific tags.",
+          "Explicitly save a memory. Use this for important facts, preferences, or patterns you want to make sure are remembered.",
         args: {
           content: tool.schema.string("The memory content to save"),
           type: tool.schema.string(
@@ -174,7 +201,7 @@ export const SoulPlugin: Plugin = async (ctx) => {
 
       need_context: tool({
         description:
-          "Deep recall — use when you need to trace back through past experiences to find specific context. This searches through your memory and past encounters from multiple angles. Use when you feel like you're missing context about something that might have come up before.",
+          "Deep recall — fires off an async search through memory and past conversations. Results arrive as a follow-up message, doesn't block your current response. Use when you feel like you're missing context about something.",
         args: {
           query: tool.schema.string(
             "What are you trying to remember or find context about?",
@@ -186,15 +213,11 @@ export const SoulPlugin: Plugin = async (ctx) => {
           ),
         },
         async execute(args, context) {
-          const result = await deepRecall(
-            args.query,
-            args.hints,
-            store,
-            embeddings,
-            cfg.recall.deep,
-            ctx,
-          );
-          return result;
+          curateAsync(context.sessionID, args.query, args.hints, {
+            client: ctx.client,
+            log,
+          });
+          return `Deep recall is searching in the background for: ${args.query}\n\nIMPORTANT: Do NOT continue working yet. The results will arrive as a [Deep Recall] message in the next few seconds. Wait for it before proceeding.`;
         },
       }),
     },

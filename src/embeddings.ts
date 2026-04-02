@@ -35,11 +35,10 @@ function cosine(a: number[], b: number[]): number {
 export async function createEmbeddings(): Promise<EmbeddingsEngine> {
   await mkdir(CACHE_DIR, { recursive: true });
 
-  // in-memory index (loaded from disk cache)
   let vectors: Embedding[] = [];
-  let pipeline: any = null;
+  let embedder: any = null;
 
-  // try to load cached vectors
+  // load cached vectors from disk
   const cache = Bun.file(join(CACHE_DIR, "vectors.json"));
   if (await cache.exists()) {
     try {
@@ -49,18 +48,16 @@ export async function createEmbeddings(): Promise<EmbeddingsEngine> {
     }
   }
 
-  // lazy-load the embedding model
+  // lazy-load fastembed model
   async function model() {
-    if (pipeline) return pipeline;
+    if (embedder) return embedder;
     try {
-      const { pipeline: createPipeline } = await import(
-        "@huggingface/transformers"
-      );
-      pipeline = await createPipeline(
-        "feature-extraction",
-        "Xenova/all-MiniLM-L6-v2",
-      );
-      return pipeline;
+      const { EmbeddingModel, FlagEmbedding } = await import("fastembed");
+      embedder = await FlagEmbedding.init({
+        model: EmbeddingModel.AllMiniLML6V2,
+        cacheDir: join(CACHE_DIR, "models"),
+      });
+      return embedder;
     } catch (err) {
       console.error("Failed to load embedding model:", err);
       return null;
@@ -75,17 +72,15 @@ export async function createEmbeddings(): Promise<EmbeddingsEngine> {
     ready: true,
 
     async embed(text) {
-      const pipe = await model();
-      if (!pipe) return [];
-      const result = await pipe(text, { pooling: "mean", normalize: true });
-      return Array.from(result.data as Float32Array);
+      const m = await model();
+      if (!m) return [];
+      return m.queryEmbed(text);
     },
 
     async index(memory) {
       const vec = await this.embed(memory.content);
       if (vec.length === 0) return;
 
-      // replace if exists
       vectors = vectors.filter((v) => v.id !== memory.id);
       vectors.push({ id: memory.id, vector: vec });
       await persist();
@@ -95,12 +90,10 @@ export async function createEmbeddings(): Promise<EmbeddingsEngine> {
       const vec = await this.embed(query);
       if (vec.length === 0) return [];
 
-      const scored = vectors
+      return vectors
         .map((v) => ({ id: v.id, score: cosine(vec, v.vector) }))
         .sort((a, b) => b.score - a.score)
         .slice(0, candidates);
-
-      return scored;
     },
   };
 }

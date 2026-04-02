@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Persistent agent identity and memory recall for OpenCode",
   "type": "module",
-  "main": "src/plugin.ts",
+  "main": "src/index.ts",
   "files": [
     "src"
   ],
@@ -37,6 +37,7 @@
     "type": "plugin",
     "hooks": [
       "experimental.chat.system.transform",
+      "experimental.chat.messages.transform",
       "chat.message",
       "experimental.session.compacting"
     ]
